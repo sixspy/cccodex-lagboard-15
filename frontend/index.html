@@ -59,6 +59,7 @@ createApp({
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const audits=ref([]), handovers=ref([]), watermarks=ref([]), mechanism=ref({});
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
     const nav=['到达登记','滞后分级','补齐恢复'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
@@ -88,6 +89,12 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const au=await loadJson('/api/recovery-audits'); if(au===null) return;
+      audits.value=Array.isArray(au.items)?au.items:[]; mechanism.value=au.mechanism||{};
+      const hc=await loadJson('/api/handover-cards'); if(hc===null) return;
+      handovers.value=Array.isArray(hc.items)?hc.items:[];
+      const wm=await loadJson('/api/watermark-cards'); if(wm===null) return;
+      watermarks.value=Array.isArray(wm.items)?wm.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -96,9 +103,15 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?(`滞后 ${j.lag_minutes} 分 · ${j.level} · ${j.output_mode}`):(j.detail||'失败');
       await refresh();
     }
-    async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doCatchup(name){
+      actionErr.value='';
+      const r=await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});
+      const j=await r.json().catch(()=>({}));
+      actionErr.value=r.ok?(`已恢复可写 · 审计卡 ${j.recovery_id} · ${j.ledger}`):(j.detail||'失败');
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,audits,handovers,watermarks,mechanism,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
   },
   template:`
   <div v-if="!token" class="login">
@@ -113,7 +126,7 @@ createApp({
       <p>左侧是各源当前输出态；右侧登记到达并做补齐恢复。</p>
       <div class="src" v-for="s in sources" :key="s.id">
         <b>{{s.name}}</b>
-        <span>SLA {{s.sla_minutes}} 分钟</span>
+        <span>SLA {{s.sla_minutes}} 分钟 · v{{s.version}}</span>
         <div class="mode" :class="modeClass(s.output_mode)">{{s.output_mode}}</div>
       </div>
       <div style="margin-top:18px;font-size:12px;color:#9db0cc">{{user}} · <a href="#" style="color:#fff" @click.prevent="logout">退出</a></div>
@@ -151,11 +164,33 @@ createApp({
           <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
           <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
         </tr></tbody></table>
+        <div class="err">{{actionErr}}</div>
       </div>
       <div class="card" v-show="tab===2">
-        <h3>补齐记录</h3>
-        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
-        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3>恢复看板 · 追责入口</h3>
+        <p style="color:#64748b;font-size:12px;margin:6px 0 4px">
+          追责机制：<b style="color:#059669">乐观锁（{{mechanism.路径||'乙路径'}}）{{mechanism.乐观锁||'生效'}}</b>
+          · 席位校验{{mechanism.席位校验||'未启用'}} · 审计专册当日不更换，落档即封存，禁改禁删
+        </p>
+        <div class="err">{{actionErr}}</div>
+        <h3 style="margin-top:14px">补齐记录（补采列表）</h3>
+        <table><thead><tr><th>恢复单号</th><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.recovery_id||'—'}}</td><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3 style="margin-top:14px">审计附页（恢复审计卡）</h3>
+        <table><thead><tr><th>专册</th><th>动作</th><th>源</th><th>席位</th><th>版本</th><th>封存</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="a in audits" :key="a.recovery_id">
+          <td>{{a.ledger}}</td>
+          <td><b :style="{color:a.action==='恢复成功'?'#059669':(a.action==='恢复审计争用'?'#d97706':'#dc2626')}">{{a.action}}</b></td>
+          <td>{{a.source}}</td><td>{{a.actor}}</td>
+          <td>v{{a.version_before}}→v{{a.version_after}}</td>
+          <td>{{a.sealed?'已封存':'未封'}}</td><td>{{a.created_at}}</td>
+        </tr></tbody></table>
+        <h3 style="margin-top:14px">交接卡</h3>
+        <table><thead><tr><th>恢复单号</th><th>源</th><th>交态</th><th>接态</th><th>席位</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in handovers" :key="x.recovery_id"><td>{{x.recovery_id}}</td><td>{{x.source}}</td><td>{{x.from_mode}}</td><td>{{x.to_mode}}</td><td>{{x.operator}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3 style="margin-top:14px">水位卡片</h3>
+        <table><thead><tr><th>源</th><th>水位（最新源时钟）</th><th>版本</th><th>恢复单号</th><th>更新时间</th></tr></thead>
+        <tbody><tr v-for="x in watermarks" :key="x.source"><td>{{x.source}}</td><td>{{x.latest_source_clock||'—'}}</td><td>v{{x.version}}</td><td>{{x.recovery_id}}</td><td>{{x.updated_at}}</td></tr></tbody></table>
       </div>
     </main>
   </div>`
